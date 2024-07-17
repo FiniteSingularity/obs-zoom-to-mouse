@@ -38,6 +38,7 @@ local locked_center = nil
 local locked_last_pos = nil
 local hotkey_zoom_id = nil
 local hotkey_follow_id = nil
+local hotkey_zoom_window_id = nil
 local is_timer_running = false
 
 local win_point = nil
@@ -74,11 +75,22 @@ local debug_logs = false
 local is_obs_loaded = false
 local is_script_loaded = false
 
+local win_point = nil
+local win_rect = nil
+local auto_follow_focus = true
+local max_window_zoom = 3
+local window_margin = 20
+
+local change_focus = false
+local focused_window_handle = nil
+
 local ZoomState = {
     None = 0,
     ZoomingIn = 1,
     ZoomingOut = 2,
     ZoomedIn = 3,
+    ZoomingInWindow = 4,
+    ZoomedInWindow = 5,
 }
 local zoom_state = ZoomState.None
 
@@ -91,13 +103,26 @@ local minor = tonumber(m2) or 0
 if ffi.os == "Windows" then
     ffi.cdef([[
         typedef int BOOL;
+        typedef unsigned long HWND;
+        typedef int DWORD;
         typedef struct{
             long x;
             long y;
         } POINT, *LPPOINT;
+        typedef struct {
+            long left;
+            long top;
+            long right;
+            long bottom;
+        } RECT, *LPRECT;
         BOOL GetCursorPos(LPPOINT);
+        HWND GetForegroundWindow();
+        BOOL GetWindowRect(HWND hWnd, LPRECT lpRect);
+        DWORD GetLastError();
     ]])
     win_point = ffi.new("POINT[1]")
+    win_rect = ffi.new("RECT")
+    win_hwnd = ffi.new("HWND")
 elseif ffi.os == "Linux" then
     ffi.cdef([[
         typedef unsigned long XID;
@@ -192,6 +217,55 @@ function get_mouse_pos()
     end
 
     return mouse
+end
+
+---
+-- Check to see if the focused window has changed
+---@return bool changed
+function focused_window_changed()
+    if ffi.os == "Windows" then
+        local win_hwnd = ffi.C.GetForegroundWindow()
+        if win_hwnd == 0 then
+            log("Handle is nil")
+            return false
+        end
+        local is_same = win_hwnd == focused_window_handle
+        if not is_same then
+            log("Change? YES")
+        end
+        
+        return win_hwnd ~= focused_window_handle
+    elseif ffi.os == "Linux" then
+        return false
+    elseif ffi.os == "OSX" then
+        return false
+    end
+end
+
+---
+-- Get the current active window rect
+---@return table Window Position
+function get_window_rect()
+    local window_rect = { top = 0, left = 0, bottom = 0, right = 0 }
+    
+    if ffi.os == "Windows" then
+        focused_window_handle = ffi.C.GetForegroundWindow()
+        if ffi.C.GetWindowRect(focused_window_handle, win_rect) ~= 0 then
+            window_rect.top = win_rect.top
+            window_rect.bottom = win_rect.bottom
+            window_rect.left = win_rect.left
+            window_rect.right = win_rect.right
+        else
+            local d_word = ffi.C.GetLastError()
+            log("ERROR: " .. d_word)
+        end
+    elseif ffi.os == "Linux" then
+        log("Linux Window not yet supported")
+    elseif ffi.os == "OSX" then
+        log("OS X Window not yet supported")
+    end
+
+    return window_rect
 end
 
 ---
@@ -752,6 +826,70 @@ function refresh_sceneitem(find_newest)
     end
 end
 
+
+function get_target_position_window(zoom)
+    local window_pos = get_window_rect()
+
+    local target_pos = { x = (window_pos.right + window_pos.left)/2.0,  y = (window_pos.top + window_pos.bottom)/2.0 }
+    local window_dims = { width = window_pos.right - window_pos.left, height = window_pos.bottom - window_pos.top }
+
+    -- If we have monitor information then we can offset the mouse by the top-left of the monitor position
+    -- This is because the display-capture source assumes top-left is 0,0 but the mouse uses the total desktop area,
+    -- so a second monitor might start at x:1920, y:0 for example, so when we click at 1920,0 we want it to look like we clicked 0,0 on the source.
+    if monitor_info then
+        target_pos.x = target_pos.x - monitor_info.x
+        target_pos.y = target_pos.y - monitor_info.y
+    end
+
+    -- Now offset the mouse by the crop top-left because if we cropped 100px off of the display clicking at 100,0 should really be the top-left 0,0
+    target_pos.x = target_pos.x - zoom.source_crop_filter.x
+    target_pos.y = target_pos.y - zoom.source_crop_filter.y
+
+    -- If the source uses a different scale to the display, apply that now.
+    -- This can happen with cloned sources, where it is cloning a scene that has a full screen display.
+    -- The display will be the full desktop pixel size, but the cloned scene will be scaled down to the canvas,
+    -- so we need to scale down the mouse movement to match
+    if monitor_info and monitor_info.scale_x and monitor_info.scale_y then
+        target_pos.x = target_pos.x * monitor_info.scale_x
+        target_pos.y = target_pos.y * monitor_info.scale_y
+    end
+    local w_zoom = zoom.source_size.width / (window_dims.width + 2 * window_margin)
+    local v_zoom = zoom.source_size.height / (window_dims.height + 2 * window_margin)
+    
+    log("DIMS- zsw: " ..zoom.source_size.width .. " x " .. zoom.source_size.height .. "   window_dims: " .. window_dims.width .. " x " .. window_dims.height)
+
+    -- See if we can get rid of the abs below
+    scale = math.min(math.abs(w_zoom), math.abs(v_zoom), max_window_zoom)
+
+    -- Get the new size after we zoom
+    -- Remember that because we are using a crop/pad filter making the size smaller (dividing by zoom) means that we see less of the image
+    -- in the same amount of space making it look bigger (aka zoomed in)
+    local new_size = {
+        width = zoom.source_size.width / scale,
+        height = zoom.source_size.height / scale
+    }
+
+    -- New offset for the crop/pad filter is whereever we clicked minus half the size, so that the clicked point because the new center
+    local pos = {
+        x = target_pos.x - new_size.width * 0.5,
+        y = target_pos.y - new_size.height * 0.5
+    }
+
+    -- Create the full crop results
+    local crop = {
+        x = pos.x,
+        y = pos.y,
+        w = new_size.width,
+        h = new_size.height,
+    }
+
+    -- Keep the zoom in bounds of the source so that we never show something outside that user is trying to hide with existing crop settings
+    crop.x = math.floor(clamp(0, (zoom.source_size.width - new_size.width), crop.x))
+    crop.y = math.floor(clamp(0, (zoom.source_size.height - new_size.height), crop.y))
+
+    return { crop = crop, raw_center = target_pos, clamped_center = { x = math.floor(crop.x + crop.w * 0.5), y = math.floor(crop.y + crop.h * 0.5) } }
+end
+
 ---
 -- Get the target position that we will attempt to zoom towards
 ---@param zoom any
@@ -825,6 +963,36 @@ function on_toggle_follow(pressed)
     end
 end
 
+function on_toggle_zoom_window(pressed)
+    if pressed then
+        log("On Toggle Zoom Window")
+        if zoom_state == ZoomState.ZoomedIn or zoom_state == ZoomState.None or zoom_state == ZoomState.ZoomedInWindow then
+            if zoom_state == ZoomState.ZoomedInWindow then
+                log("Zooming out")
+                zoom_state = ZoomState.ZoomingOut
+                zoom_time = 0
+                locked_center = nil
+                locked_last_pos = nil
+                zoom_target = { crop = crop_filter_info_orig, c = sceneitem_crop_orig }
+            else
+                log("Zooming Into Window")
+                zoom_state = ZoomState.ZoomingInWindow
+                zoom_info.zoom_to = zoom_value
+                zoom_time = 0
+                locked_center = nil
+                locked_last_pos = nil
+                zoom_target = get_target_position_window(zoom_info)
+            end
+            -- Since we are zooming we need to start the timer for the animation and tracking
+            if is_timer_running == false then
+                is_timer_running = true
+                local timer_interval = math.floor(obs.obs_get_frame_interval_ns() / 1000000)
+                obs.timer_add(on_timer, timer_interval)
+            end
+        end
+    end
+end
+
 function on_toggle_zoom(pressed)
     if pressed then
         -- Check if we are in a safe state to zoom
@@ -867,7 +1035,7 @@ function on_timer()
         -- Update our zoom time that we use for the animation
         zoom_time = zoom_time + zoom_speed
 
-        if zoom_state == ZoomState.ZoomingOut or zoom_state == ZoomState.ZoomingIn then
+        if zoom_state == ZoomState.ZoomingOut or zoom_state == ZoomState.ZoomingIn or zoom_state == ZoomState.ZoomingInWindow then
             -- When we are doing a zoom animation (in or out) we linear interpolate the crop to the target
             if zoom_time <= 1 then
                 -- If we have auto-follow turned on, make sure to keep the mouse in the view while we zoom
@@ -990,6 +1158,15 @@ function on_timer()
                     zoom_target = get_target_position(zoom_info)
                     locked_center = { x = zoom_target.clamped_center.x, y = zoom_target.clamped_center.y }
                     log("Cursor stopped. Tracking locked to " .. locked_center.x .. ", " .. locked_center.y)
+                end
+            elseif zoom_state == ZoomState.ZoomingInWindow then
+                log("Zoomed In Window")
+                zoom_state = ZoomState.ZoomedInWindow
+                should_stop_timer = not auto_follow_focus
+            elseif zoom_state == ZoomState.ZoomedInWindow then
+                if focused_window_changed() then
+                    zoom_state = ZoomState.None
+                    on_toggle_zoom_window(true)
                 end
             end
 
@@ -1279,6 +1456,10 @@ function script_properties()
     obs.obs_property_set_long_description(override_dw, "X resolution of your montior")
     obs.obs_property_set_long_description(override_dh, "Y resolution of your monitor")
 
+    local window_follow_focus = obs.obs_properties_add_bool(props, "auto_follow_focus", "Auto Follow Focus")
+    local window_max_zoom = obs.obs_properties_add_float(props, "window_max_zoom", "Window Max Zoom", 1.0, 10.0, 0.1)
+    local window_margin = obs.obs_properties_add_int(props, "window_margin", "Window Zoom Margin", 0, 250, 1)
+
     if socket_available then
         local socket_props = obs.obs_properties_create();
         local r_label = obs.obs_properties_add_text(socket_props, "socket_label", "", obs.OBS_TEXT_INFO)
@@ -1341,6 +1522,10 @@ function script_load(settings)
     hotkey_follow_id = obs.obs_hotkey_register_frontend("toggle_follow_hotkey", "Toggle follow mouse during zoom",
         on_toggle_follow)
 
+    hotkey_zoom_window_id = obs.obs_hotkey_register_frontend("toggle_zoom_window_hotkey", "Toggle zoom to window",
+        on_toggle_zoom_window
+    )
+
     -- Attempt to reload existing hotkey bindings if we can find any
     local hotkey_save_array = obs.obs_data_get_array(settings, "obs_zoom_to_mouse.hotkey.zoom")
     obs.obs_hotkey_load(hotkey_zoom_id, hotkey_save_array)
@@ -1348,6 +1533,10 @@ function script_load(settings)
 
     hotkey_save_array = obs.obs_data_get_array(settings, "obs_zoom_to_mouse.hotkey.follow")
     obs.obs_hotkey_load(hotkey_follow_id, hotkey_save_array)
+    obs.obs_data_array_release(hotkey_save_array)
+
+    hotkey_save_array = obs.obs_data_get_array(settings, "obs_zoom_to_mouse.hotkey.zoom_to_window")
+    obs.obs_hotkey_load(hotkey_zoom_window_id, hotkey_save_array)
     obs.obs_data_array_release(hotkey_save_array)
 
     -- Load any other settings
@@ -1373,6 +1562,10 @@ function script_load(settings)
     socket_port = obs.obs_data_get_int(settings, "socket_port")
     socket_poll = obs.obs_data_get_int(settings, "socket_poll")
     debug_logs = obs.obs_data_get_bool(settings, "debug_logs")
+
+    auto_follow_focus = obs.obs_data_get_bool(settings, "auto_follow_focus")
+    max_window_zoom = obs.obs_data_get_double(settings, "window_max_zoom")
+    window_margin = obs.obs_data_get_double(settings, "window_margin")
 
     obs.obs_frontend_add_event_callback(on_frontend_event)
 
@@ -1418,6 +1611,7 @@ function script_unload()
 
         obs.obs_hotkey_unregister(on_toggle_zoom)
         obs.obs_hotkey_unregister(on_toggle_follow)
+        obs.obs_hotkey_unregister(on_toggle_zoom_window)
         obs.obs_frontend_remove_event_callback(on_frontend_event)
         release_sceneitem()
     end
@@ -1456,6 +1650,9 @@ function script_defaults(settings)
     obs.obs_data_set_default_bool(settings, "use_socket", false)
     obs.obs_data_set_default_int(settings, "socket_port", 12345)
     obs.obs_data_set_default_int(settings, "socket_poll", 10)
+    obs.obs_data_set_default_bool(settings, "auto_follow_focus", false)
+    obs.obs_data_set_default_double(settings, "window_max_zoom", 3.0)
+    obs.obs_data_set_default_double(settings, "window_margin", 16.0)
     obs.obs_data_set_default_bool(settings, "debug_logs", false)
 end
 
@@ -1470,6 +1667,12 @@ function script_save(settings)
     if hotkey_follow_id ~= nil then
         local hotkey_save_array = obs.obs_hotkey_save(hotkey_follow_id)
         obs.obs_data_set_array(settings, "obs_zoom_to_mouse.hotkey.follow", hotkey_save_array)
+        obs.obs_data_array_release(hotkey_save_array)
+    end
+
+    if hotkey_zoom_window_id ~= nul then
+        local hotkey_save_array = obs.obs_hotkey_save(hotkey_zoom_window_id)
+        obs.obs_data_set_array(settings, "obs_zoom_to_mouse.hotkey.zoom_to_window", hotkey_save_array)
         obs.obs_data_array_release(hotkey_save_array)
     end
 end
@@ -1513,6 +1716,10 @@ function script_update(settings)
     socket_port = obs.obs_data_get_int(settings, "socket_port")
     socket_poll = obs.obs_data_get_int(settings, "socket_poll")
     debug_logs = obs.obs_data_get_bool(settings, "debug_logs")
+
+    auto_follow_focus = obs.obs_data_get_bool(settings, "auto_follow_focus")
+    max_window_zoom = obs.obs_data_get_double(settings, "window_max_zoom")
+    window_margin = obs.obs_data_get_double(settings, "window_margin")
 
     -- Only do the expensive refresh if the user selected a new source
     if source_name ~= old_source_name and is_obs_loaded then
